@@ -33,7 +33,7 @@ def load_models():
     embed_model = SentenceTransformer("shawhin/distilroberta-ai-job-embeddings")
     nlp = spacy.load("en_core_web_md")
     skill_extractor = SkillExtractor(nlp, SKILL_DB, PhraseMatcher)
-    return embed_model, skill_extractor
+    return embed_model, skill_extractor, nlp
 
 
 # ---------------- Text extraction ----------------
@@ -61,49 +61,92 @@ def extract_resume_text(resume_file) -> str:
 
 # ---------------- Skill extraction & scoring ----------------
 
-def clean_annotations(annotations, min_score: float = 0.65) -> set:
+# skillNer's 31,278-skill database contains a lot of real product/company/
+# language names that collide with everyday English words. When the JD uses
+# these words in their ordinary sense (e.g. "nice to have", "basic
+# understanding", "familiarity with common libraries"), skillNer still tags
+# them as required "skills" — which then show up as false "missing skills"
+# no resume could ever satisfy. We drop these known collisions outright.
+GENERIC_FALSE_POSITIVES = {
+    "nice",       # collides with NICE, the workforce-management software company
+    "basic",      # collides with BASIC, the programming language
+    "basics",
+    "library",    # too generic to mean any specific library (NumPy, Pandas, etc.)
+    "libraries",
+    "good",
+    "strong",
+    "solid",
+}
+
+
+def normalize_skill(skill: str, nlp) -> str:
+    """Lemmatize a skill phrase so plural/singular variants (e.g. 'data
+    structures' vs 'data structure') are treated as the same skill when
+    comparing resume vs. JD skill sets."""
+    doc = nlp(skill)
+    return " ".join(token.lemma_ for token in doc).lower().strip()
+
+
+def clean_annotations(annotations, nlp, min_score: float = 0.65) -> dict:
     """Filter skillNer output to real, actionable technical skills.
 
-    Uses three filters: (1) stopwords, (2) confidence score for fuzzy matches,
+    Uses four filters: (1) stopwords, (2) confidence score for fuzzy matches,
     (3) skill_type == 'Hard Skill' from skillNer's own database, since soft-skill
     phrases like 'collaboratively' or 'professionally' aren't things you can
-    meaningfully add as a resume keyword.
+    meaningfully add as a resume keyword, and (4) a blacklist of known
+    ambiguous-word false positives (see GENERIC_FALSE_POSITIVES).
+
+    Returns a dict mapping a normalized (lemmatized) form of each skill to its
+    original display text, so callers can compare skill sets in a way that's
+    robust to singular/plural differences while still showing the user a
+    natural-looking label.
     """
     english_stopwords = set(stopwords.words("english"))
-    clean_skills = set()
+    clean_skills = {}  # display text -> display text (used for dedup pass)
 
     def is_hard_skill(skill_id) -> bool:
         entry = SKILL_DB.get(skill_id, {})
         return entry.get("skill_type", "").lower() == "hard skill"
 
+    def is_allowed(skill: str) -> bool:
+        return (
+            len(skill) > 2
+            and skill not in english_stopwords
+            and skill not in GENERIC_FALSE_POSITIVES
+        )
+
     for match in annotations["results"]["full_matches"]:
         skill = match["doc_node_value"].lower().strip()
-        if len(skill) > 2 and skill not in english_stopwords and is_hard_skill(match.get("skill_id")):
-            clean_skills.add(skill)
+        if is_allowed(skill) and is_hard_skill(match.get("skill_id")):
+            clean_skills[skill] = skill
 
     for match in annotations["results"]["ngram_scored"]:
         skill = match["doc_node_value"].lower().strip()
         score = match.get("score", 0)
-        if (
-            len(skill) > 2
-            and skill not in english_stopwords
-            and score >= min_score
-            and is_hard_skill(match.get("skill_id"))
-        ):
-            clean_skills.add(skill)
+        if is_allowed(skill) and score >= min_score and is_hard_skill(match.get("skill_id")):
+            clean_skills[skill] = skill
 
     # Drop any skill that's just a shorter substring of another matched skill
     # (e.g. "professional" swallowed by "professional development") to reduce
     # near-duplicate variants in the final list.
-    deduped = {
+    deduped_display = {
         s for s in clean_skills
         if not any(s != other and s in other for other in clean_skills)
     }
 
-    return deduped
+    # Build the normalized -> display mapping used for set comparisons. If two
+    # display variants normalize to the same lemma (e.g. "data structure" and
+    # "data structures"), keep the shorter/more common-looking one for display.
+    normalized_map = {}
+    for skill in deduped_display:
+        norm = normalize_skill(skill, nlp)
+        if norm not in normalized_map or len(skill) < len(normalized_map[norm]):
+            normalized_map[norm] = skill
+
+    return normalized_map
 
 
-def compute_scores(embed_model, skill_extractor, resume_text: str, jd_text: str, weight_keyword: float = 0.6) -> dict:
+def compute_scores(embed_model, skill_extractor, nlp, resume_text: str, jd_text: str, weight_keyword: float = 0.6) -> dict:
     """Compute semantic + keyword scores for one resume/JD pair. Reused by both
     the single-JD tab and the multi-job ranking tab."""
     resume_emb = embed_model.encode(resume_text)
@@ -114,11 +157,17 @@ def compute_scores(embed_model, skill_extractor, resume_text: str, jd_text: str,
 
     resume_annotations = skill_extractor.annotate(resume_text)
     jd_annotations = skill_extractor.annotate(jd_text)
-    resume_skills = clean_annotations(resume_annotations)
-    jd_skills = clean_annotations(jd_annotations)
-    matched_skills = jd_skills.intersection(resume_skills)
-    missing_skills = jd_skills - resume_skills
-    keyword_match_score = len(matched_skills) / len(jd_skills) if jd_skills else 0
+    resume_skills = clean_annotations(resume_annotations, nlp)  # normalized -> display
+    jd_skills = clean_annotations(jd_annotations, nlp)
+
+    resume_norm = set(resume_skills.keys())
+    jd_norm = set(jd_skills.keys())
+    matched_norm = jd_norm & resume_norm
+    missing_norm = jd_norm - resume_norm
+
+    matched_skills = {jd_skills[n] for n in matched_norm}
+    missing_skills = {jd_skills[n] for n in missing_norm}
+    keyword_match_score = len(matched_norm) / len(jd_norm) if jd_norm else 0
 
     final_score = (keyword_match_score * weight_keyword) + (similarity_score * (1 - weight_keyword))
 
@@ -255,10 +304,10 @@ with tab1:
             resume_text = st.session_state.resume_text
 
             with st.spinner("Loading models (first run takes longer)..."):
-                embed_model, skill_extractor = load_models()
+                embed_model, skill_extractor, nlp = load_models()
 
             with st.spinner("Scoring resume against job description..."):
-                scores = compute_scores(embed_model, skill_extractor, resume_text, jd_text, weight_keyword)
+                scores = compute_scores(embed_model, skill_extractor, nlp, resume_text, jd_text, weight_keyword)
 
             analysis = None
             with st.spinner("Generating AI analysis (suggestions, sections, hands-on check)..."):
@@ -371,14 +420,14 @@ with tab1:
                     st.warning("Select at least one skill to simulate.")
                 else:
                     with st.spinner("Recalculating with simulated skills..."):
-                        embed_model, skill_extractor = load_models()
+                        embed_model, skill_extractor, nlp = load_models()
                         augmented_resume = (
                             st.session_state.resume_text
                             + "\n\nAdditional Skills: "
                             + ", ".join(selected_skills)
                         )
                         projected_scores = compute_scores(
-                            embed_model, skill_extractor, augmented_resume, jd_text_used, weight_keyword
+                            embed_model, skill_extractor, nlp, augmented_resume, jd_text_used, weight_keyword
                         )
 
                     p1, p2, p3 = st.columns(3)
@@ -427,12 +476,12 @@ with tab2:
             else:
                 resume_text = st.session_state.resume_text
                 with st.spinner("Loading models (first run takes longer)..."):
-                    embed_model, skill_extractor = load_models()
+                    embed_model, skill_extractor, nlp = load_models()
 
                 results = []
                 progress = st.progress(0, text="Scoring jobs...")
                 for i, (title, jd_body) in enumerate(jobs):
-                    scores = compute_scores(embed_model, skill_extractor, resume_text, jd_body, weight_keyword)
+                    scores = compute_scores(embed_model, skill_extractor, nlp, resume_text, jd_body, weight_keyword)
                     results.append({
                         "Job": title,
                         "Match %": round(scores["final"] * 100, 1),
