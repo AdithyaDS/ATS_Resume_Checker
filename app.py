@@ -30,7 +30,7 @@ DOMAINS = [
 def load_models():
     """Load all heavy models once and cache them across reruns/users."""
     nltk.download("stopwords")
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    embed_model = SentenceTransformer("shawhin/distilroberta-ai-job-embeddings")
     nlp = spacy.load("en_core_web_md")
     skill_extractor = SkillExtractor(nlp, SKILL_DB, PhraseMatcher)
     return embed_model, skill_extractor
@@ -260,23 +260,7 @@ with tab1:
             with st.spinner("Scoring resume against job description..."):
                 scores = compute_scores(embed_model, skill_extractor, resume_text, jd_text, weight_keyword)
 
-            rating = rating_for(scores["final"])
-
-            st.markdown("## Results")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Final ATS Score", f"{scores['final']:.0%}")
-            m2.metric("Keyword Match", f"{scores['keyword']:.0%}")
-            m3.metric("Semantic Similarity", f"{scores['similarity']:.0%}")
-            st.markdown(f"**Rating:** {rating}")
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("### ✅ Matched Skills")
-                st.write(", ".join(sorted(scores["matched"])) if scores["matched"] else "None found")
-            with c2:
-                st.markdown("### ❌ Missing Skills")
-                st.write(", ".join(sorted(scores["missing"])) if scores["missing"] else "None — great match!")
-
+            analysis = None
             with st.spinner("Generating AI analysis (suggestions, sections, hands-on check)..."):
                 try:
                     client = Groq(api_key=groq_api_key)
@@ -285,55 +269,139 @@ with tab1:
                         scores["keyword"], scores["similarity"],
                         scores["matched"], scores["missing"],
                     )
-
-                    st.markdown("## 💡 AI-Powered Suggestions")
-                    st.info(analysis["overall_feedback"])
-
-                    st.markdown("**Actionable Suggestions:**")
-                    for s in analysis["suggestions"]:
-                        st.markdown(f"- {s}")
-
-                    st.markdown("**How to Address Missing Skills:**")
-                    for fix in analysis["missing_skill_fixes"]:
-                        st.markdown(f"- **{fix['skill']}**: {fix['fix']}")
-
-                    st.markdown("**Bullet Point Rewrite Example:**")
-                    st.markdown(f"*Original:* {analysis['bullet_rewrite']['original']}")
-                    st.markdown(f"*Improved:* {analysis['bullet_rewrite']['improved']}")
-
-                    st.markdown("## 🧩 Resume Breakdown")
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        st.markdown("### Skills Section")
-                        skills_list = analysis.get("skills_section", [])
-                        if skills_list:
-                            st.write(", ".join(skills_list))
-                        else:
-                            st.write("No dedicated skills section detected.")
-
-                    with b2:
-                        st.markdown("### Hands-On Experience Check")
-                        checks = analysis.get("hands_on_check", [])
-                        if checks:
-                            for item in checks:
-                                icon = "✅" if item.get("has_hands_on_experience") else "⚠️"
-                                st.markdown(f"{icon} **{item['skill']}** — {item['note']}")
-                        else:
-                            st.write("No skills to check.")
-
-                    st.markdown("### Projects")
-                    projects = analysis.get("projects", [])
-                    if projects:
-                        for proj in projects:
-                            with st.container(border=True):
-                                st.markdown(f"**{proj['title']}**")
-                                st.caption(", ".join(proj.get("tech_stack", [])))
-                                st.write(proj.get("summary", ""))
-                    else:
-                        st.write("No distinct projects detected in the resume.")
-
                 except Exception as e:
                     st.error(f"Could not generate AI analysis: {e}")
+
+            # Store everything needed to render results (and the projected-score
+            # simulator below) so it survives future reruns triggered by other
+            # widgets, not just this button click.
+            st.session_state.tab1_result = {
+                "jd_text": jd_text,
+                "scores": scores,
+                "analysis": analysis,
+            }
+
+    if "tab1_result" in st.session_state:
+        result = st.session_state.tab1_result
+        scores = result["scores"]
+        analysis = result["analysis"]
+        jd_text_used = result["jd_text"]
+        rating = rating_for(scores["final"])
+
+        st.markdown("## Results")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Final ATS Score", f"{scores['final']:.0%}")
+        m2.metric("Keyword Match", f"{scores['keyword']:.0%}")
+        m3.metric("Semantic Similarity", f"{scores['similarity']:.0%}")
+        st.markdown(f"**Rating:** {rating}")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### ✅ Matched Skills")
+            st.write(", ".join(sorted(scores["matched"])) if scores["matched"] else "None found")
+        with c2:
+            st.markdown("### ❌ Missing Skills")
+            st.write(", ".join(sorted(scores["missing"])) if scores["missing"] else "None — great match!")
+
+        if analysis:
+            st.markdown("## 💡 AI-Powered Suggestions")
+            st.info(analysis["overall_feedback"])
+
+            st.markdown("**Actionable Suggestions:**")
+            for s in analysis["suggestions"]:
+                st.markdown(f"- {s}")
+
+            st.markdown("**How to Address Missing Skills:**")
+            for fix in analysis["missing_skill_fixes"]:
+                st.markdown(f"- **{fix['skill']}**: {fix['fix']}")
+
+            st.markdown("**Bullet Point Rewrite Example:**")
+            st.markdown(f"*Original:* {analysis['bullet_rewrite']['original']}")
+            st.markdown(f"*Improved:* {analysis['bullet_rewrite']['improved']}")
+
+            st.markdown("## 🧩 Resume Breakdown")
+            b1, b2 = st.columns(2)
+            with b1:
+                st.markdown("### Skills Section")
+                skills_list = analysis.get("skills_section", [])
+                if skills_list:
+                    st.write(", ".join(skills_list))
+                else:
+                    st.write("No dedicated skills section detected.")
+
+            with b2:
+                st.markdown("### Hands-On Experience Check")
+                checks = analysis.get("hands_on_check", [])
+                if checks:
+                    for item in checks:
+                        icon = "✅" if item.get("has_hands_on_experience") else "⚠️"
+                        st.markdown(f"{icon} **{item['skill']}** — {item['note']}")
+                else:
+                    st.write("No skills to check.")
+
+            st.markdown("### Projects")
+            projects = analysis.get("projects", [])
+            if projects:
+                for proj in projects:
+                    with st.container(border=True):
+                        st.markdown(f"**{proj['title']}**")
+                        st.caption(", ".join(proj.get("tech_stack", [])))
+                        st.write(proj.get("summary", ""))
+            else:
+                st.write("No distinct projects detected in the resume.")
+
+        # ---- Projected score: "what if I added these skills?" ----
+        st.markdown("## 📈 Projected Score")
+        missing_list = sorted(scores["missing"])
+        if not missing_list:
+            st.write("No missing skills — you're already matching everything found in the JD!")
+        else:
+            st.caption(
+                "Pick which missing skills you'd realistically add to your resume, "
+                "and see how much your score would improve."
+            )
+            selected_skills = st.multiselect(
+                "Missing skills to simulate adding",
+                missing_list,
+                default=missing_list,
+                key="projected_skills",
+            )
+            if st.button("Calculate Projected Score", key="calc_projected"):
+                if not selected_skills:
+                    st.warning("Select at least one skill to simulate.")
+                else:
+                    with st.spinner("Recalculating with simulated skills..."):
+                        embed_model, skill_extractor = load_models()
+                        augmented_resume = (
+                            st.session_state.resume_text
+                            + "\n\nAdditional Skills: "
+                            + ", ".join(selected_skills)
+                        )
+                        projected_scores = compute_scores(
+                            embed_model, skill_extractor, augmented_resume, jd_text_used, weight_keyword
+                        )
+
+                    p1, p2, p3 = st.columns(3)
+                    p1.metric(
+                        "Projected Final Score",
+                        f"{projected_scores['final']:.0%}",
+                        delta=f"{(projected_scores['final'] - scores['final']) * 100:+.1f} pts",
+                    )
+                    p2.metric(
+                        "Projected Keyword Match",
+                        f"{projected_scores['keyword']:.0%}",
+                        delta=f"{(projected_scores['keyword'] - scores['keyword']) * 100:+.1f} pts",
+                    )
+                    p3.metric(
+                        "Projected Semantic Similarity",
+                        f"{projected_scores['similarity']:.0%}",
+                        delta=f"{(projected_scores['similarity'] - scores['similarity']) * 100:+.1f} pts",
+                    )
+                    st.caption(
+                        "This simulates adding these skills as plain text (e.g. to a skills "
+                        "section) — it does not guarantee a real ATS would score it the same way, "
+                        "but it shows the realistic ceiling for how much closing these gaps could help."
+                    )
 
 # ---------- TAB 2: multiple JDs, ranked ----------
 with tab2:
