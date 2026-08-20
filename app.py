@@ -7,7 +7,8 @@ import spacy
 from skillNer.general_params import SKILL_DB
 from skillNer.skill_extractor_class import SkillExtractor
 from spacy.matcher import PhraseMatcher
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, brown
+from collections import Counter
 import nltk
 import json
 from groq import Groq
@@ -26,14 +27,26 @@ DOMAINS = [
 
 # ---------------- Model loading ----------------
 
+def build_common_words(top_n: int = 6000) -> set:
+    """Build a set of the most frequent everyday English words from a general
+    (non-technical) corpus. Used to automatically detect when skillNer has
+    matched a plain English word (e.g. 'nice', 'basic', 'library') to an
+    unrelated skill-database entry (a company/language/product with the same
+    name), rather than hardcoding each collision by hand as we find it."""
+    freq = Counter(w.lower() for w in brown.words() if w.isalpha())
+    return {w for w, _ in freq.most_common(top_n)}
+
+
 @st.cache_resource
 def load_models():
     """Load all heavy models once and cache them across reruns/users."""
     nltk.download("stopwords")
+    nltk.download("brown")
     embed_model = SentenceTransformer("shawhin/distilroberta-ai-job-embeddings")
     nlp = spacy.load("en_core_web_md")
     skill_extractor = SkillExtractor(nlp, SKILL_DB, PhraseMatcher)
-    return embed_model, skill_extractor, nlp
+    common_words = build_common_words()
+    return embed_model, skill_extractor, nlp, common_words
 
 
 # ---------------- Text extraction ----------------
@@ -61,24 +74,6 @@ def extract_resume_text(resume_file) -> str:
 
 # ---------------- Skill extraction & scoring ----------------
 
-# skillNer's 31,278-skill database contains a lot of real product/company/
-# language names that collide with everyday English words. When the JD uses
-# these words in their ordinary sense (e.g. "nice to have", "basic
-# understanding", "familiarity with common libraries"), skillNer still tags
-# them as required "skills" — which then show up as false "missing skills"
-# no resume could ever satisfy. We drop these known collisions outright.
-GENERIC_FALSE_POSITIVES = {
-    "nice",       # collides with NICE, the workforce-management software company
-    "basic",      # collides with BASIC, the programming language
-    "basics",
-    "library",    # too generic to mean any specific library (NumPy, Pandas, etc.)
-    "libraries",
-    "good",
-    "strong",
-    "solid",
-}
-
-
 def normalize_skill(skill: str, nlp) -> str:
     """Lemmatize a skill phrase so plural/singular variants (e.g. 'data
     structures' vs 'data structure') are treated as the same skill when
@@ -87,14 +82,52 @@ def normalize_skill(skill: str, nlp) -> str:
     return " ".join(token.lemma_ for token in doc).lower().strip()
 
 
-def clean_annotations(annotations, nlp, min_score: float = 0.65) -> dict:
+def is_generic_word_match(raw_text: str, skill_lower: str, common_words: set) -> bool:
+    """True if this match is likely a false positive: skillNer's 31,278-skill
+    database contains many real product/company/language names that are also
+    everyday English words (NICE the company, BASIC the language, etc). When
+    the source text uses the word in its ordinary sense ("nice to have",
+    "basic understanding"), we want to drop it — but when it's clearly used
+    as a proper noun / brand / acronym ("Python", "NICE", "React"), we want
+    to keep it. This applies the same rule to ANY word, not just ones we've
+    manually discovered, by using general word-frequency data instead of a
+    hardcoded list.
+
+    Checked word-by-word rather than on the whole phrase at once: skillNer's
+    fuzzy matching sometimes pulls in an extra everyday word alongside the
+    real match (e.g. "basics basic" out of "...the basics of X..."), which
+    LOOKS like a multi-word technical term but is actually still just plain
+    English on every token — so a phrase only survives this check if it has
+    at least one genuinely rare/technical word in it.
+    """
+    tokens = skill_lower.replace("-", " ").split()
+    raw_tokens = raw_text.replace("-", " ").split()
+    if not tokens:
+        return False
+
+    if not all(t in common_words for t in tokens):
+        return False  # at least one rare/technical token -> genuine skill, keep
+
+    # Every token is a common English word. Only trust the phrase as a real
+    # skill if it was written like a proper noun / acronym rather than plain
+    # lowercase prose.
+    for rt in raw_tokens:
+        if rt.isupper() and len(rt) > 1:
+            return False  # acronym-style, e.g. "NICE" -> likely intentional
+        if rt[:1].isupper() and not rt.islower():
+            return False  # Title-cased, e.g. "Python" -> likely intentional
+    return True  # plain lowercase common word -> generic false positive, drop it
+
+
+def clean_annotations(annotations, nlp, common_words: set, min_score: float = 0.65) -> dict:
     """Filter skillNer output to real, actionable technical skills.
 
     Uses four filters: (1) stopwords, (2) confidence score for fuzzy matches,
     (3) skill_type == 'Hard Skill' from skillNer's own database, since soft-skill
     phrases like 'collaboratively' or 'professionally' aren't things you can
-    meaningfully add as a resume keyword, and (4) a blacklist of known
-    ambiguous-word false positives (see GENERIC_FALSE_POSITIVES).
+    meaningfully add as a resume keyword, and (4) a general everyday-word
+    check (see is_generic_word_match) that catches ANY word that collides
+    with skillNer's database, not just ones found by hand.
 
     Returns a dict mapping a normalized (lemmatized) form of each skill to its
     original display text, so callers can compare skill sets in a way that's
@@ -108,22 +141,24 @@ def clean_annotations(annotations, nlp, min_score: float = 0.65) -> dict:
         entry = SKILL_DB.get(skill_id, {})
         return entry.get("skill_type", "").lower() == "hard skill"
 
-    def is_allowed(skill: str) -> bool:
+    def is_allowed(raw_text: str, skill_lower: str) -> bool:
         return (
-            len(skill) > 2
-            and skill not in english_stopwords
-            and skill not in GENERIC_FALSE_POSITIVES
+            len(skill_lower) > 2
+            and skill_lower not in english_stopwords
+            and not is_generic_word_match(raw_text, skill_lower, common_words)
         )
 
     for match in annotations["results"]["full_matches"]:
-        skill = match["doc_node_value"].lower().strip()
-        if is_allowed(skill) and is_hard_skill(match.get("skill_id")):
+        raw = match["doc_node_value"].strip()
+        skill = raw.lower()
+        if is_allowed(raw, skill) and is_hard_skill(match.get("skill_id")):
             clean_skills[skill] = skill
 
     for match in annotations["results"]["ngram_scored"]:
-        skill = match["doc_node_value"].lower().strip()
+        raw = match["doc_node_value"].strip()
+        skill = raw.lower()
         score = match.get("score", 0)
-        if is_allowed(skill) and score >= min_score and is_hard_skill(match.get("skill_id")):
+        if is_allowed(raw, skill) and score >= min_score and is_hard_skill(match.get("skill_id")):
             clean_skills[skill] = skill
 
     # Drop any skill that's just a shorter substring of another matched skill
@@ -146,7 +181,7 @@ def clean_annotations(annotations, nlp, min_score: float = 0.65) -> dict:
     return normalized_map
 
 
-def compute_scores(embed_model, skill_extractor, nlp, resume_text: str, jd_text: str, weight_keyword: float = 0.6) -> dict:
+def compute_scores(embed_model, skill_extractor, nlp, common_words: set, resume_text: str, jd_text: str, weight_keyword: float = 0.6) -> dict:
     """Compute semantic + keyword scores for one resume/JD pair. Reused by both
     the single-JD tab and the multi-job ranking tab."""
     resume_emb = embed_model.encode(resume_text)
@@ -157,8 +192,8 @@ def compute_scores(embed_model, skill_extractor, nlp, resume_text: str, jd_text:
 
     resume_annotations = skill_extractor.annotate(resume_text)
     jd_annotations = skill_extractor.annotate(jd_text)
-    resume_skills = clean_annotations(resume_annotations, nlp)  # normalized -> display
-    jd_skills = clean_annotations(jd_annotations, nlp)
+    resume_skills = clean_annotations(resume_annotations, nlp, common_words)  # normalized -> display
+    jd_skills = clean_annotations(jd_annotations, nlp, common_words)
 
     resume_norm = set(resume_skills.keys())
     jd_norm = set(jd_skills.keys())
@@ -304,10 +339,10 @@ with tab1:
             resume_text = st.session_state.resume_text
 
             with st.spinner("Loading models (first run takes longer)..."):
-                embed_model, skill_extractor, nlp = load_models()
+                embed_model, skill_extractor, nlp, common_words = load_models()
 
             with st.spinner("Scoring resume against job description..."):
-                scores = compute_scores(embed_model, skill_extractor, nlp, resume_text, jd_text, weight_keyword)
+                scores = compute_scores(embed_model, skill_extractor, nlp, common_words, resume_text, jd_text, weight_keyword)
 
             analysis = None
             with st.spinner("Generating AI analysis (suggestions, sections, hands-on check)..."):
@@ -420,14 +455,14 @@ with tab1:
                     st.warning("Select at least one skill to simulate.")
                 else:
                     with st.spinner("Recalculating with simulated skills..."):
-                        embed_model, skill_extractor, nlp = load_models()
+                        embed_model, skill_extractor, nlp, common_words = load_models()
                         augmented_resume = (
                             st.session_state.resume_text
                             + "\n\nAdditional Skills: "
                             + ", ".join(selected_skills)
                         )
                         projected_scores = compute_scores(
-                            embed_model, skill_extractor, nlp, augmented_resume, jd_text_used, weight_keyword
+                            embed_model, skill_extractor, nlp, common_words, augmented_resume, jd_text_used, weight_keyword
                         )
 
                     p1, p2, p3 = st.columns(3)
@@ -476,12 +511,12 @@ with tab2:
             else:
                 resume_text = st.session_state.resume_text
                 with st.spinner("Loading models (first run takes longer)..."):
-                    embed_model, skill_extractor, nlp = load_models()
+                    embed_model, skill_extractor, nlp, common_words = load_models()
 
                 results = []
                 progress = st.progress(0, text="Scoring jobs...")
                 for i, (title, jd_body) in enumerate(jobs):
-                    scores = compute_scores(embed_model, skill_extractor, nlp, resume_text, jd_body, weight_keyword)
+                    scores = compute_scores(embed_model, skill_extractor, nlp, common_words, resume_text, jd_body, weight_keyword)
                     results.append({
                         "Job": title,
                         "Match %": round(scores["final"] * 100, 1),
